@@ -3811,7 +3811,11 @@ function setupCargoGateAssembly(parentObj) {
   // - 승강 도어 패널: 실제 문짝 본체(Door_Sectional_Logistics, BottomWhite)만 포함하여 비정상 막대기 이동 방지
   gate1Meshes.forEach(mesh => {
     const n = mesh.name;
-    if (n.includes('Track_') || n.includes('HoistMotor_') || n.includes('TorsionShaft') || n.includes('Stile_')) {
+    if (n.includes('Stile_')) {
+      // 화물문 개구부를 가로막는 세로 기둥(스타일) 제거 — 2026-11-08 사용자 지시
+      mesh.visible = false;
+      if (mesh.parent) mesh.parent.remove(mesh);
+    } else if (n.includes('Track_') || n.includes('HoistMotor_') || n.includes('TorsionShaft')) {
       cargoGateMasterAssembly.add(mesh);
     } else {
       gatePanelsGroup.add(mesh);
