@@ -3808,11 +3808,18 @@ function setupCargoGateAssembly(parentObj) {
 
   // Gate 1 (섹셔널 도어) 메쉬 엄격 분리 편성:
   // - 고정 프레임 요소: 트랙, 모터, 상부 토션 샤프트 바(TorsionShaft), 수직 프레임 포스트(Stile)
-  // - 승강 도어 패널: 실제 문짝 본체(Door_Sectional_Logistics, BottomWhite)만 포함하여 비정상 막대기 이동 방지
+  // - 승강 도어 패널: 실제 문짝 본체(Door_Sectional_Logistics)만 포함하여 비정상 막대기 이동 방지
   gate1Meshes.forEach(mesh => {
     const n = mesh.name;
     if (n.includes('Stile_')) {
       // 화물문 개구부를 가로막는 세로 기둥(스타일) 제거 — 2026-11-08 사용자 지시
+      mesh.visible = false;
+      if (mesh.parent) mesh.parent.remove(mesh);
+    } else if (n.includes('BottomWhite')) {
+      // 화물문 하단 흰색 패널 제거 — 2026-11-09 사용자 지시
+      // 주 문짝(Door_Sectional_Logistics, Z 0~4200)이 전 높이를 이미 덮는데,
+      // BottomWhite는 흰색 재질로 따로 지정되고 문짝 면보다 30mm 돌출(Y 15850~15890 vs 15880)되어
+      // 하단이 들떠 보임. 제거하면 문짝이 바닥까지 하나의 균일한 골강판 면이 됨.
       mesh.visible = false;
       if (mesh.parent) mesh.parent.remove(mesh);
     } else if (n.includes('Track_') || n.includes('HoistMotor_') || n.includes('TorsionShaft')) {
