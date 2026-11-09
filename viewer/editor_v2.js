@@ -2961,7 +2961,8 @@ function updateWASDCameraMovement(dt) {
 // ============================================================================
 function loadPrecisionModel() {
   const loader = new THREE.OBJLoader();
-  loader.load('/model.obj', (obj) => {
+  // GitHub Pages(정적, 서브경로)에서는 상대경로로, 로컬 서버에서는 /model.obj 라우트로
+  const onShellLoaded = (obj) => {
     if (factoryMeshGroup) scene.remove(factoryMeshGroup);
     factoryMeshGroup = obj;
 
@@ -3123,7 +3124,8 @@ function loadPrecisionModel() {
     const urlView = new URLSearchParams(window.location.search).get('view');
     if (urlView) setView(urlView);
     log('[PBR] 건축 쉘 메쉬(원본 SolidCraft STEP 226개 솔리드를 OBJ로 변환)에 골강판 노멀맵, 에폭시 바닥 반사, H-빔 스틸 셰이더 적용.');
-  });
+  };
+  loader.load('factory_precision.obj', onShellLoaded, undefined, () => loader.load('/model.obj', onShellLoaded));
 }
 
 // ============================================================================
@@ -3209,8 +3211,8 @@ function toggleWireframe() {
 }
 
 function loadGaussianSplats() {
-  fetch('/true_3dgs.bin')
-    .then(res => res.arrayBuffer())
+  fetch('true_3dgs.bin')
+    .then(res => { if (!res.ok) throw new Error('splat not found: ' + res.status); return res.arrayBuffer(); })
     .then(buf => {
       const floats = new Float32Array(buf);
       const count = floats.length / 13;
