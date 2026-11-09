@@ -8,7 +8,10 @@
  *   "내부 보기" makes machine shells see-through so the moving internals are visible.
  *   Modeled part → job → the part is clamped on the router table / disappears into the printer →
  *   comes out in front of the machine.  PLC interlocks hold machines; PLC outputs follow production.
- *   Live telemetry (axes included) goes out over WebSocket /ws at 5 Hz.
+ *   Router 배정 builds a real single-part nest + NC program (TwinNest.nestSinglePart) and
+ *   machines a sheet with real carving (TwinNest.drive); the old synthetic outline trace is
+ *   kept only as a fallback when the NC pipeline is unavailable. AM printers still use the
+ *   synthetic path. Live telemetry (axes included) goes out over WebSocket /ws at 5 Hz.
  *
  * Depends on editor_v2.js globals (THREE, scene, camera, controls, placedObjects, ASSET_CATALOG,
  * virtualPLC, gateState, log) and /lib/twin_runtime.js + /lib/machine_kinematics.js.
@@ -201,6 +204,37 @@
 
   function assignPart(partObj, machineName) {
     const ud = partObj.userData;
+    const m = rt.machines.get(machineName);
+    // Router: build a real single-part nest + NC program and machine a sheet (TwinNest.nestSinglePart).
+    // The job carries job.prog + job.nest, so driveRouter delegates to TwinNest.drive and the
+    // sheet is really carved. Blocked only when the G-code verification fails (out of bounds).
+    if (m && m.kind === 'router' && typeof NcProgram !== 'undefined' && window.TwinNest && window.TwinNest.nestSinglePart) {
+      try {
+        const settings = window.TwinNest.toolSettings();
+        const partData = { id: ud.libraryId || ('sketch-' + partObj.name), name: partObj.name, vertices: ud.vertices, holes: (ud.holes || []).filter(h => h.isSubtract), thickness: ud.thickness };
+        const { nest, gen, prog } = window.TwinNest.nestSinglePart(partData, settings);
+        const verify = NcProgram.verifyProgram(prog, { L: nest.opts.sheetL, W: nest.opts.sheetW, toolDia: settings.tool.dia, tabTopZ: gen.tabTopZ, tabs: gen.tabs, warnings: gen.warnings, clampZones: window.TwinNest.clampZones(nest.opts.sheetL, nest.opts.sheetW) });
+        if (!verify.ok) {
+          const bad = verify.checks.filter(c => c.level === 'error').map(c => c.detail).join(' / ');
+          log(`⚠️ [생산] '${partObj.name}' G-code 검증 실패 — ${bad}`);
+          toast('G-code 검증 실패: ' + bad, true);
+          return null;
+        }
+        const sheetPart = { name: `${partObj.name} · 원판`, shape: 'sheet', thicknessMm: ud.thickness, bboxMm: [nest.opts.sheetL, nest.opts.sheetW, ud.thickness], count: 1 };
+        const job = rt.assignProgram(machineName, sheetPart, prog.totalS);
+        job.prog = prog; job.nest = nest; job.sheetJob = true;
+        partObjects.set(job.id, partObj);
+        ud.inMachine = machineName; ud.sheetJob = true;
+        const warnTxt = verify.checks.filter(c => c.level === 'warn').map(c => `${c.label}: ${c.detail}`).join(' / ');
+        log(`🏭 [생산] '${partObj.name}' → ${machineName} 작업 #${job.id} (원판 ${nest.opts.sheetL}×${nest.opts.sheetW}×${ud.thickness} mm, ${settings.material.name}, NC ${prog.lines}줄, 예상 ${fmtS(prog.totalS)})${warnTxt ? ' · ⚠ ' + warnTxt : ''}`);
+        toast(`작업 #${job.id} 배정 → ${machineName} (원판 절삭)`);
+        return job;
+      } catch (e) {
+        log(`⚠️ [생산] 원판 절삭 배정 실패, 윤곽 추적 방식으로 대체: ${e.message}`);
+        // fall through to the synthetic trace path below
+      }
+    }
+    // fallback: synthetic outline trace (AM printers, or NcProgram unavailable / NC build failed)
     const part = TwinRuntime.partFromSketch(partObj.name, ud.vertices, ud.holes, ud.thickness);
     let job;
     try { job = rt.assign(machineName, part); }
@@ -233,20 +267,30 @@
       const machineObj = placedObjects.find(o => o.name === e.machine);
       if (e.type === 'JOB_START' && partObj && machineObj) {
         const m = rt.machines.get(e.machine);
-        if (m.kind === 'router') placeOnRouter(partObj, machineObj);   // clamped on the vacuum table, visible
+        if (partObj.userData.sheetJob) {
+          // sheet job: the design mesh stays put — the stock is the nest sheet, not the part mesh
+        } else if (m.kind === 'router') placeOnRouter(partObj, machineObj);   // clamped on the vacuum table, visible
         else partObj.visible = false;                                  // inside the printer chamber
       }
       if (e.type === 'JOB_DONE') {
         if (partObj && machineObj) {
-          const [, D] = assetDims(machineObj);
-          const out = machineObj.localToWorld(new THREE.Vector3(0, -(D / 2 + 700), 0));
-          partObj.parent.worldToLocal(out);
-          partObj.position.x = out.x; partObj.position.y = out.y;
-          partObj.position.z = (partObj.userData.thickness || 40) / 2;
-          partObj.visible = true;
-          partObj.userData.inMachine = null;
-          partObj.userData.processedBy = e.machine;
-          partObj.userData.processedAt = new Date().toISOString();
+          if (partObj.userData.sheetJob) {
+            // sheet job: the finished part is already spawned by TwinNest.onEvent; just clear the flags
+            partObj.userData.inMachine = null;
+            partObj.userData.sheetJob = null;
+            partObj.userData.processedBy = e.machine;
+            partObj.userData.processedAt = new Date().toISOString();
+          } else {
+            const [, D] = assetDims(machineObj);
+            const out = machineObj.localToWorld(new THREE.Vector3(0, -(D / 2 + 700), 0));
+            partObj.parent.worldToLocal(out);
+            partObj.position.x = out.x; partObj.position.y = out.y;
+            partObj.position.z = (partObj.userData.thickness || 40) / 2;
+            partObj.visible = true;
+            partObj.userData.inMachine = null;
+            partObj.userData.processedBy = e.machine;
+            partObj.userData.processedAt = new Date().toISOString();
+          }
         }
         log(`✅ [생산] 작업 #${e.job} 완료: '${e.part}' (${e.machine})`);
         toast(`작업 #${e.job} 완료 — ${e.part}`);
@@ -419,6 +463,11 @@
     document.getElementById('tl-machines').innerHTML = snap.machines.length ? snap.machines.map(m => {
       const col = hex(PHASE_COLOR[m.phase] || 0x64748b);
       const chips = axisChips(m).map(([k, v]) => `<span>${k ? `<em>${k}</em>` : ''}${v ?? '–'}</span>`).join('');
+      let massLine = '';
+      if (m.kind === 'router' && m.jobId && window.TwinNest && window.TwinNest.removedMass) {
+        const rm = window.TwinNest.removedMass(m.jobId);
+        if (rm && rm.massG > 0) massLine = `<div class="muted">원판 제거 ${rm.massG.toFixed(1)} g · ${rm.volCm3.toFixed(1)} cm³ (${rm.material}, 약)</div>`;
+      }
       return `<div class="card">
         <div class="row"><span class="dot" style="background:${col};box-shadow:0 0 8px ${col}"></span>
           <span class="nm" title="${m.name}">${m.name}</span><span class="kind">${TwinRuntime.KIND_LABEL[m.kind]}</span>
@@ -426,7 +475,7 @@
         <div class="bar"><i style="width:${m.progress}%;background:${col}"></i></div>
         <div class="row muted"><span style="color:${col}">${PHASE_KO[m.phase] || m.phase}</span>
           <span class="sp"></span>${m.jobId ? `#${m.jobId} · ${m.progress}% · 남은 ${fmtS(m.remainS)}` : `완료 ${m.completed} · 대기 ${m.queue} · 가동률 ${m.utilization}%`}</div>
-        <div class="ax">${chips}</div>
+        <div class="ax">${chips}</div>${massLine}
       </div>`;
     }).join('') : '<div class="muted">배치된 생산 설비 없음</div>';
 

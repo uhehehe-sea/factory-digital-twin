@@ -153,6 +153,7 @@
   function parse(text) {
     const segs = [];
     let x = 0, y = 0, z = CLEAR_Z, mode = 0, F = 1000, spindle = 0;
+    let liftZ = null;   // Z the tool was lifted to for a holding tab (G01 Z-up below the surface)
     text.split(/\r?\n/).forEach((raw, idx) => {
       const line = raw.replace(/\([^)]*\)/g, '').trim().toUpperCase();
       if (!line || line === '%' || line[0] === 'O') return;
@@ -164,6 +165,17 @@
       if (/M0?5\b/.test(line)) spindle = 0;
       if (w.X === undefined && w.Y === undefined && w.Z === undefined) return;
       const nx = w.X ?? x, ny = w.Y ?? y, nz = w.Z ?? z;
+      // Holding-tab tracking: a G01 Z-only lift below the surface marks the tab height;
+      // XY moves at that height are tab spans (the tool must not cut deeper there).
+      // A plunge (Z down) or any rapid clears it.
+      const zOnly = nx === x && ny === y && nz !== z;
+      if (zOnly) {
+        if (mode === 0) liftZ = null;
+        else if (nz > z) liftZ = nz < 0 ? nz : null;
+        else liftZ = null;
+      }
+      const isTab = !zOnly && mode !== 0 && liftZ !== null && z < 0 && nz < 0 &&
+        Math.abs(z - liftZ) < 1e-6 && Math.abs(nz - liftZ) < 1e-6 && (nx !== x || ny !== y);
       if (mode === 2 || mode === 3) {
         const cx = x + (w.I || 0), cy = y + (w.J || 0), R = Math.hypot(x - cx, y - cy);
         let a0 = Math.atan2(y - cy, x - cx), a1 = Math.atan2(ny - cy, nx - cx);
@@ -173,11 +185,11 @@
         for (let k = 1; k <= n; k++) {
           const a = a0 + (a1 - a0) * k / n, qz = z + (nz - z) * k / n;
           const qx = cx + R * Math.cos(a), qy = cy + R * Math.sin(a);
-          segs.push({ x0: px, y0: py, z0: pz, x1: qx, y1: qy, z1: qz, rapid: false, feed: F, line: idx + 1, spindle });
+          segs.push({ x0: px, y0: py, z0: pz, x1: qx, y1: qy, z1: qz, rapid: false, feed: F, line: idx + 1, spindle, tab: isTab });
           px = qx; py = qy; pz = qz;
         }
       } else {
-        segs.push({ x0: x, y0: y, z0: z, x1: nx, y1: ny, z1: nz, rapid: mode === 0, feed: F, line: idx + 1, spindle });
+        segs.push({ x0: x, y0: y, z0: z, x1: nx, y1: ny, z1: nz, rapid: mode === 0, feed: F, line: idx + 1, spindle, tab: isTab });
       }
       x = nx; y = ny; z = nz;
     });
@@ -219,5 +231,101 @@
     };
   }
 
-  return { DEFAULT_TOOL, DEFAULT_TABS, POSTS, offsetOutward, generate, parse, timing, load, axesAt };
+  // ------------------------------------------------------------------ verification
+  /** Distance from a point to a segment. */
+  function distPtSeg(px, py, s) {
+    const dx = s.x1 - s.x0, dy = s.y1 - s.y0;
+    const len2 = dx * dx + dy * dy;
+    let u = 0;
+    if (len2 > 0) u = Math.max(0, Math.min(1, ((px - s.x0) * dx + (py - s.y0) * dy) / len2));
+    return Math.hypot(px - (s.x0 + dx * u), py - (s.y0 + dy * u));
+  }
+  function orient(a, b, c) { return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x); }
+  function onSeg(a, b, c) { return Math.min(a.x, c.x) - 1e-9 <= b.x && b.x <= Math.max(a.x, c.x) + 1e-9 && Math.min(a.y, c.y) - 1e-9 <= b.y && b.y <= Math.max(a.y, c.y) + 1e-9; }
+  function segsIntersect(p1, p2, p3, p4) {
+    const d1 = orient(p3, p4, p1), d2 = orient(p3, p4, p2), d3 = orient(p1, p2, p3), d4 = orient(p1, p2, p4);
+    if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) return true;
+    if (Math.abs(d1) < 1e-9 && onSeg(p3, p1, p4)) return true;
+    if (Math.abs(d2) < 1e-9 && onSeg(p3, p2, p4)) return true;
+    if (Math.abs(d3) < 1e-9 && onSeg(p1, p3, p2)) return true;
+    if (Math.abs(d4) < 1e-9 && onSeg(p1, p4, p2)) return true;
+    return false;
+  }
+  /** Min distance between two segments (0 when they touch). */
+  function segSegDist(a, b) {
+    if (segsIntersect({ x: a.x0, y: a.y0 }, { x: a.x1, y: a.y1 }, { x: b.x0, y: b.y0 }, { x: b.x1, y: b.y1 })) return 0;
+    return Math.min(distPtSeg(a.x0, a.y0, b), distPtSeg(a.x1, a.y1, b), distPtSeg(b.x0, b.y0, a), distPtSeg(b.x1, b.y1, a));
+  }
+  /** Min distance from a segment to an axis-aligned rect {x0,y0,x1,y1} (0 on overlap). */
+  function segRectDist(s, r) {
+    const inRect = (x, y) => x >= r.x0 && x <= r.x1 && y >= r.y0 && y <= r.y1;
+    if (inRect(s.x0, s.y0) || inRect(s.x1, s.y1)) return 0;
+    const edges = [
+      { x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y0 }, { x0: r.x1, y0: r.y0, x1: r.x1, y1: r.y1 },
+      { x0: r.x1, y0: r.y1, x1: r.x0, y1: r.y1 }, { x0: r.x0, y0: r.y1, x1: r.x0, y1: r.y0 }
+    ];
+    let d = Infinity;
+    for (const e of edges) d = Math.min(d, segSegDist(s, e));
+    return d;
+  }
+  function fmtDur(s) {
+    s = Math.round(s);
+    if (s >= 3600) return `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
+    if (s >= 60) return `${Math.floor(s / 60)}m ${s % 60}s`;
+    return `${s}s`;
+  }
+
+  /**
+   * Verify a loaded program against a sheet before sending it to the router.
+   * prog: NcProgram.load() result.
+   * sheet: { L, W, toolDia, tabTopZ, tabs, warnings, clampZones }.
+   *   tabs: generate() tabInfo [{windows}] — tab count is summed.
+   *   warnings: generate() warnings (shown, never blocking).
+   *   clampZones: [{x0,y0,x1,y1}] in sheet coords (omitted → clamp check skipped).
+   * Returns { ok, checks: [{id, label, level: 'ok'|'warn'|'error', detail}], warnings }.
+   * ok is false only on a hard error (the tool edge would leave the sheet).
+   * Clamp proximity and generator warnings only warn — they never block.
+   */
+  function verifyProgram(prog, sheet) {
+    const s = Object.assign({ L: 2440, W: 1220, toolDia: 6, tabTopZ: null, tabs: [], warnings: [], clampZones: [] }, sheet || {});
+    const r = s.toolDia / 2;
+    const checks = [];
+    const warnings = (s.warnings || []).slice();
+    const cut = prog.segs.filter(sg => !sg.rapid && Math.min(sg.z0, sg.z1) < 0 && (sg.x0 !== sg.x1 || sg.y0 !== sg.y1));
+    checks.push({ id: 'lines', label: '프로그램', level: 'ok', detail: `${prog.lines}줄 · 절삭 ${(prog.cutLenMm / 1000).toFixed(1)} m · 예상 ${fmtDur(prog.totalS)}` });
+    const tabCount = (s.tabs || []).reduce((a, t) => a + (t.windows ? t.windows.length : 0), 0);
+    checks.push({ id: 'tabs', label: '고정 탭', level: 'ok', detail: `${tabCount}개 · 탭 상단 Z ${s.tabTopZ !== null && s.tabTopZ !== undefined ? s.tabTopZ.toFixed(1) : '–'} mm` });
+    // bounds: the tool edge must stay on the sheet
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const sg of cut) { minX = Math.min(minX, sg.x0, sg.x1); maxX = Math.max(maxX, sg.x0, sg.x1); minY = Math.min(minY, sg.y0, sg.y1); maxY = Math.max(maxY, sg.y0, sg.y1); }
+    if (!cut.length) {
+      checks.push({ id: 'bounds', label: '공구 경로 범위', level: 'error', detail: '절삭 구간이 없습니다' });
+    } else if (minX - r < 0 || maxX + r > s.L || minY - r < 0 || maxY + r > s.W) {
+      checks.push({ id: 'bounds', label: '공구 경로 범위', level: 'error', detail: `공구 가장자리가 원판을 벗어남 (X ${(minX - r).toFixed(1)}–${(maxX + r).toFixed(1)} / Y ${(minY - r).toFixed(1)}–${(maxY + r).toFixed(1)}, 원판 ${s.L}×${s.W})` });
+    } else {
+      checks.push({ id: 'bounds', label: '공구 경로 범위', level: 'ok', detail: `공구 경로 X ${minX.toFixed(1)}–${maxX.toFixed(1)}, Y ${minY.toFixed(1)}–${maxY.toFixed(1)} — 원판 안에 있음` });
+    }
+    // clamps: warn if the tool centre path comes within one tool radius of a clamp
+    if (s.clampZones && s.clampZones.length) {
+      let worst = Infinity, worstZone = -1;
+      for (const sg of cut) {
+        for (let zi = 0; zi < s.clampZones.length; zi++) {
+          const z = s.clampZones[zi];
+          if (Math.max(sg.x0, sg.x1) + r < z.x0 || Math.min(sg.x0, sg.x1) - r > z.x1 ||
+              Math.max(sg.y0, sg.y1) + r < z.y0 || Math.min(sg.y0, sg.y1) - r > z.y1) continue;  // AABB reject
+          const d = segRectDist(sg, z);
+          if (d < worst) { worst = d; worstZone = zi; }
+        }
+      }
+      if (worst < r) checks.push({ id: 'clamps', label: '클램프 간섭', level: 'warn', detail: `공구 경로가 클램프 ${worstZone + 1}번 영역에 ${worst.toFixed(1)} mm까지 접근 (공구 반경 ${r} mm 이내)` });
+      else checks.push({ id: 'clamps', label: '클램프 간섭', level: 'ok', detail: worst === Infinity ? '공구 경로와 클램프가 멀리 떨어져 있음' : `가장 가까운 클램프까지 ${worst.toFixed(1)} mm` });
+    } else {
+      checks.push({ id: 'clamps', label: '클램프 간섭', level: 'ok', detail: '클램프 영역 정보 없음 — 검사 생략' });
+    }
+    for (const w of warnings) checks.push({ id: 'gen', label: '생성 경고', level: 'warn', detail: w });
+    const ok = !checks.some(c => c.level === 'error');
+    return { ok, checks, warnings };
+  }
+
+  return { DEFAULT_TOOL, DEFAULT_TABS, POSTS, offsetOutward, generate, parse, timing, load, axesAt, verifyProgram };
 });

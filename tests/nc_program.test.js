@@ -91,3 +91,53 @@ test('replay: timing positive, axesAt follows the program from first move to the
   const mid = NC.axesAt(prog, prog.totalS / 2);
   assert.ok(mid.line > 0 && mid.spindle_rpm === 18000);
 });
+
+test('parse: holding-tab spans are flagged tab, cutting spans are not', () => {
+  const r = NC.generate(sheetParts(), { thickness: 12, tool: { stepDown: 4 }, tabs: { count: 4, width: 8, height: 2 } });
+  const segs = NC.parse(r.text);
+  const tabSegs = segs.filter(s => s.tab);
+  assert.ok(tabSegs.length > 0, 'tab spans flagged');
+  for (const s of tabSegs) {
+    assert.equal(s.z0, r.tabTopZ);
+    assert.equal(s.z1, r.tabTopZ);
+    assert.ok(!s.rapid);
+  }
+  // passes are at depths 4, 8, 12, 12.3 mm; only the two deeper than the tab top
+  // (-10 mm) lift over the tabs, so 4 tabs x 2 passes = 8 flagged spans
+  assert.equal(tabSegs.length, 8);
+});
+
+test('verify: a program on its own sheet passes bounds and clamps', () => {
+  const r = NC.generate(sheetParts(), { thickness: 12 });
+  const prog = NC.load(r.text);
+  const v = NC.verifyProgram(prog, {
+    L: 1220, W: 800, toolDia: 6, tabTopZ: r.tabTopZ, tabs: r.tabs, warnings: r.warnings,
+    clampZones: [{ x0: 0, y0: 0, x1: 100, y1: 100 }]
+  });
+  assert.ok(v.ok);
+  assert.equal(v.checks.find(c => c.id === 'bounds').level, 'ok');
+  assert.equal(v.checks.find(c => c.id === 'clamps').level, 'ok');
+  assert.equal(v.checks.find(c => c.id === 'tabs').level, 'ok');
+});
+
+test('verify: a toolpath that leaves a deliberately small sheet is a hard error', () => {
+  const r = NC.generate(sheetParts(), { thickness: 12 });
+  const prog = NC.load(r.text);
+  const v = NC.verifyProgram(prog, { L: 200, W: 200, toolDia: 6, tabTopZ: r.tabTopZ, tabs: r.tabs, warnings: [] });
+  assert.equal(v.ok, false);
+  assert.equal(v.checks.find(c => c.id === 'bounds').level, 'error');
+});
+
+test('verify: a clamp zone next to the toolpath warns (never blocks), generator warnings pass through', () => {
+  const r = NC.generate(sheetParts(), { thickness: 12 });
+  const prog = NC.load(r.text);
+  const v = NC.verifyProgram(prog, {
+    L: 1220, W: 800, toolDia: 6, tabTopZ: r.tabTopZ, tabs: r.tabs, warnings: ['테스트 경고'],
+    clampZones: [{ x0: 440, y0: 290, x1: 560, y1: 310 }]   // sits right under the outline edge
+  });
+  assert.ok(v.ok, 'clamp proximity must not block');
+  assert.equal(v.checks.find(c => c.id === 'clamps').level, 'warn');
+  assert.ok(v.checks.some(c => c.id === 'gen' && c.level === 'warn' && c.detail === '테스트 경고'));
+  assert.deepEqual(v.warnings, ['테스트 경고']);
+});
+

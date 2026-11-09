@@ -4,7 +4,7 @@
   "scripts": {
     "dev": "node viewer/server.mjs --port=8089",
     "start": "node viewer/server.mjs",
-    "test": "node --test tests/"
+    "test": "node --test tests/*.test.js"
   },
   "dependencies": {
     "ktx-parse": "^2.0.0",
